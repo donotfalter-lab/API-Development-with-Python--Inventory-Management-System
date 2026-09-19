@@ -1,4 +1,7 @@
+import requests
 from flask import Flask, jsonify, request
+
+from external_api import fetch_product_details
 
 app = Flask(__name__)
 
@@ -46,6 +49,15 @@ INVENTORY = [
 ]
 
 REQUIRED_FIELDS = ["product_name", "quantity", "price"]
+UPDATABLE_FIELDS = [
+    "barcode",
+    "product_name",
+    "brands",
+    "ingredients_text",
+    "category",
+    "quantity",
+    "price",
+]
 
 
 def find_item(item_id):
@@ -73,19 +85,29 @@ def get_item(id):
 def create_item():
     data = request.get_json(silent=True) or {}
 
-    missing = [field for field in REQUIRED_FIELDS if field not in data]
+    barcode = data.get("barcode", "")
+    enriched = {}
+    if barcode:
+        try:
+            enriched = fetch_product_details(barcode=barcode) or {}
+        except requests.exceptions.RequestException:
+            enriched = {}
+
+    merged = {**enriched, **data}
+
+    missing = [field for field in REQUIRED_FIELDS if field not in merged]
     if missing:
         return jsonify({"error": f"Missing required field(s): {', '.join(missing)}"}), 400
 
     new_item = {
         "id": next_id(),
-        "barcode": data.get("barcode", ""),
-        "product_name": data["product_name"],
-        "brands": data.get("brands", ""),
-        "ingredients_text": data.get("ingredients_text", ""),
-        "category": data.get("category", ""),
-        "quantity": data["quantity"],
-        "price": data["price"],
+        "barcode": merged.get("barcode", ""),
+        "product_name": merged["product_name"],
+        "brands": merged.get("brands", ""),
+        "ingredients_text": merged.get("ingredients_text", ""),
+        "category": merged.get("category", ""),
+        "quantity": merged["quantity"],
+        "price": merged["price"],
     }
     INVENTORY.append(new_item)
     return jsonify(new_item), 201
@@ -98,16 +120,7 @@ def update_item(id):
         return jsonify({"error": f"No inventory item found with id {id}."}), 404
 
     data = request.get_json(silent=True) or {}
-    updatable_fields = [
-        "barcode",
-        "product_name",
-        "brands",
-        "ingredients_text",
-        "category",
-        "quantity",
-        "price",
-    ]
-    for field in updatable_fields:
+    for field in UPDATABLE_FIELDS:
         if field in data:
             item[field] = data[field]
 
@@ -122,6 +135,54 @@ def delete_item(id):
 
     INVENTORY.remove(item)
     return "", 204
+
+
+@app.route("/inventory/<int:id>/refresh", methods=["PATCH"])
+def refresh_item(id):
+    item = find_item(id)
+    if item is None:
+        return jsonify({"error": f"No inventory item found with id {id}."}), 404
+
+    if not item.get("barcode"):
+        return jsonify({"error": "This item has no barcode on file to refresh from."}), 400
+
+    try:
+        product = fetch_product_details(barcode=item["barcode"])
+    except requests.exceptions.RequestException:
+        return jsonify({"error": "Could not reach the OpenFoodFacts API. Please try again later."}), 503
+
+    if product is None:
+        return jsonify({"error": "No matching product was found for this barcode."}), 404
+
+    for field in ["product_name", "brands", "ingredients_text", "category"]:
+        if product.get(field):
+            item[field] = product[field]
+
+    return jsonify(item), 200
+
+
+@app.route("/products/lookup", methods=["GET"])
+def lookup_product():
+    barcode = request.args.get("barcode")
+    name = request.args.get("name")
+
+    if not barcode and not name:
+        return jsonify({"error": "Provide a 'barcode' or 'name' query parameter."}), 400
+
+    try:
+        product = fetch_product_details(barcode=barcode, name=name)
+    except requests.exceptions.RequestException:
+        return jsonify({"error": "Could not reach the OpenFoodFacts API. Please try again later."}), 503
+
+    if product is None:
+        return jsonify({"error": "No matching product was found."}), 404
+
+    return jsonify(product), 200
+
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":
